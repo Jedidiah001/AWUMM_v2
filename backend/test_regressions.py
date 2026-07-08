@@ -296,6 +296,39 @@ class RegressionTests(unittest.TestCase):
             if os.path.exists(db_path):
                 os.remove(db_path)
 
+    def test_reset_all_championship_history_vacates_titles_and_stats(self):
+        temp_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'test_tmp'))
+        os.makedirs(temp_root, exist_ok=True)
+        db_path = os.path.join(temp_root, f'{uuid.uuid4().hex}.db')
+        database = None
+        try:
+            database = Database(db_path)
+            title = Championship('reset_title', 'Reset Championship', 'ROC Alpha', 'World')
+            title.award_title('wrestler_a', 'Wrestler A', 'show1', 'ROC Alpha Weekly', 1, 1)
+            title.award_title('wrestler_b', 'Wrestler B', 'show2', 'ROC Alpha Weekly', 1, 3)
+            database.save_championship(title)
+            database.conn.execute(
+                "INSERT OR REPLACE INTO wrestler_stats (wrestler_id, total_title_reigns, total_days_as_champion, longest_reign_days, last_updated) VALUES (?, 2, 14, 14, ?)",
+                ('wrestler_a', 'now'),
+            )
+            database.conn.commit()
+
+            result = database.reset_all_championship_history()
+            champ = database.get_championship_by_id('reset_title')
+            stats = database.get_wrestler_stats('wrestler_a')
+
+            self.assertEqual(1, result['championships_vacated'])
+            self.assertGreaterEqual(result['reigns_deleted'], 2)
+            self.assertIsNone(champ['current_holder_id'])
+            self.assertEqual([], database.get_title_reigns(title_id='reset_title'))
+            self.assertEqual(0, stats['total_title_reigns'])
+            self.assertEqual(0, stats['total_days_as_champion'])
+        finally:
+            if database is not None:
+                database.close()
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
 
 if __name__ == '__main__':
     unittest.main()

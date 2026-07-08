@@ -222,6 +222,8 @@ class AIShowrunnerService:
                 arc = recommendation.get("living_arc") or {}
                 if arc.get("arc_type") == "faction_formation_betrayal_seed":
                     self._materialize_living_arc_faction(arc)
+                elif arc.get("arc_type") == "alignment_turn":
+                    self._materialize_alignment_turn(arc)
         except Exception:
             # Approval decisions should still persist even if optional world materialization fails.
             pass
@@ -266,6 +268,20 @@ class AIShowrunnerService:
             if faction:
                 created.append(faction)
         return created
+
+
+    def _materialize_alignment_turn(self, arc: dict) -> None:
+        target = arc.get("target_alignment")
+        participant = next((p for p in arc.get("participants", []) if p.get("role") == "turn_focus"), None)
+        if not target or not participant or not participant.get("id"):
+            return
+        percentage = {"Heel": 0, "Tweener": 50, "Face": 100}.get(target, 50)
+        now = self.now()
+        self.conn.execute(
+            "UPDATE wrestlers SET alignment = ?, alignment_percentage = ?, updated_at = ? WHERE id = ?",
+            (target, percentage, now, participant["id"]),
+        )
+        self.conn.commit()
 
     def _materialize_living_arc_faction(self, arc: dict) -> dict | None:
         participants = arc.get("participants") or []
@@ -373,6 +389,7 @@ class AIShowrunnerService:
         self._decode_run(run)
         card = run.get("generated_card_json") or {}
         draft = self._card_to_booking_draft(run, card)
+        self._append_scheduled_crown_matches_to_draft(draft)
         return {
             "available": True,
             "run": {
@@ -1031,7 +1048,7 @@ class AIShowrunnerService:
                 turn_candidate = ranked[min(1, len(ranked) - 1)]
                 current = str(turn_candidate.get("alignment") or "Tweener")
                 target = rng.choice([a for a in ["Face", "Heel", "Tweener"] if a != current] or ["Tweener"])
-                proposals.append({"arc_type": "alignment_turn", "brand": brand, "division": gender, "title": f"Turn arc: {turn_candidate['name']} toward {target}", "summary": f"Begin a paced {current}-to-{target} character shift for {turn_candidate['name']} with weekly story consequences before any final turn is applied.", "participants": [{"id": turn_candidate["id"], "name": turn_candidate["name"], "role": "turn_focus"}], "beats": ["Ambiguous promo motive", "Choice between friend and ambition", "Crowd-reaction checkpoint", "Major-show reveal", "Approval decides final alignment"], "mechanical_effects": ["character_direction +10", "alignment_pressure +12", "story_progression +8"]})
+                proposals.append({"arc_type": "alignment_turn", "brand": brand, "division": gender, "target_alignment": target, "title": f"Turn arc: {turn_candidate['name']} toward {target}", "summary": f"Begin a paced {current}-to-{target} character shift for {turn_candidate['name']} with weekly story consequences before any final turn is applied.", "participants": [{"id": turn_candidate["id"], "name": turn_candidate["name"], "role": "turn_focus"}], "beats": ["Ambiguous promo motive", "Choice between friend and ambition", "Crowd-reaction checkpoint", "Major-show reveal", "Approval decides final alignment"], "mechanical_effects": ["character_direction +10", "alignment_pressure +12", "story_progression +8"]})
         rng.shuffle(proposals)
         return proposals[: (4 if is_major_window else 2)]
 
@@ -1358,6 +1375,28 @@ class AIShowrunnerService:
         """Fetch the existing WarGames plan for the upcoming target event, or build one."""
         self._ensure_tables()
         return self._refresh_war_games_system(year, week, roster, universe, rng or random.Random())
+
+    def _full_war_games_depth_available(self, roster: list[dict]) -> bool:
+        return all(
+            len([w for w in roster if str(w.get("gender", "")).lower() == gender]) >= 10
+            for gender in ("male", "female")
+        )
+
+    def _war_games_plan_is_full_gender_split(self, plan: dict) -> bool:
+        divisions = plan.get("divisions_json") or plan.get("divisions") or {}
+        for division_key, gender in (("mens", "male"), ("womens", "female")):
+            division = divisions.get(division_key) or {}
+            for side_key in ("team_a", "team_b"):
+                team = division.get(side_key) or []
+                if len(team) != 5:
+                    return False
+                if any(str(member.get("gender", "")).lower() != gender for member in team):
+                    return False
+        return True
+
+    def _delete_invalid_war_games_plan(self, plan_id: str) -> None:
+        self.conn.execute("DELETE FROM war_games_plans WHERE id = ?", (plan_id,))
+        self.conn.commit()
 
     def _row_to_wrestler(self, row: dict):
         from models.wrestler import Wrestler
@@ -1769,7 +1808,10 @@ class AIShowrunnerService:
             (target_name, target_year, target_week),
         )
         if existing:
-            return self._decode_war_games(existing)
+            decoded_existing = self._decode_war_games(existing)
+            if not (self._full_war_games_depth_available(roster) and not self._war_games_plan_is_full_gender_split(decoded_existing)):
+                return decoded_existing
+            self._delete_invalid_war_games_plan(decoded_existing["id"])
         ranked = sorted(roster, key=lambda w: (w.get("overall", 0), w.get("popularity", 0)), reverse=True)
         divisions = {}
         flat_teams = []
@@ -2168,6 +2210,49 @@ class AIShowrunnerService:
             "warnings": ["AI-generated card: review major/title implications before simulating."],
         }
         return self.repo.replace_show_plan(plan, segments)
+
+
+    def _append_scheduled_crown_matches_to_draft(self, draft: dict) -> None:
+        """Add ready King/Queen tournament matches scheduled for this show/week into the AI draft."""
+        tournaments = self.list_crown_tournaments(limit=10)
+        next_position = max([int(m.get("card_position") or m.get("position") or 0) for m in draft.get("matches", [])] + [0]) + 1
+        seen = {m.get("match_id") for m in draft.get("matches", [])}
+        for tournament in tournaments:
+            for round_data in (tournament.get("bracket") or {}).get("rounds", []):
+                for match in round_data.get("matches", []):
+                    scheduled = match.get("scheduled") or {}
+                    same_show = scheduled.get("show_id") and scheduled.get("show_id") == draft.get("show_id")
+                    same_week = int(scheduled.get("year") or draft.get("year") or 0) == int(draft.get("year") or 0) and int(scheduled.get("week") or 0) == int(draft.get("week") or 0)
+                    if not (same_show or same_week):
+                        continue
+                    if match.get("winner") or not match.get("wrestler_a") or not match.get("wrestler_b"):
+                        continue
+                    match_id = f"crown_{tournament['id']}_r{round_data['round']}_m{match['match_num']}"
+                    if match_id in seen:
+                        continue
+                    a, b = match["wrestler_a"], match["wrestler_b"]
+                    draft.setdefault("matches", []).append({
+                        "match_id": match_id,
+                        "match_type": "singles",
+                        "participants": [a["id"], b["id"]],
+                        "side_a": {"wrestler_ids": [a["id"]], "wrestler_names": [a["name"]], "is_tag_team": False},
+                        "side_b": {"wrestler_ids": [b["id"]], "wrestler_names": [b["name"]], "is_tag_team": False},
+                        "booked_winner": (match.get("winner") or {}).get("id"),
+                        "booking_bias": "even",
+                        "importance": "tournament",
+                        "planned_duration_minutes": 12 if round_data["round"] < 3 else 18,
+                        "duration": 12 if round_data["round"] < 3 else 18,
+                        "position": next_position,
+                        "card_position": next_position,
+                        "is_title_match": False,
+                        "allow_cross_brand": True,
+                        "tournament_id": tournament["id"],
+                        "tournament_round": round_data["round"],
+                        "tournament_match_num": match["match_num"],
+                        "ai_description": f"{tournament['name']} {round_data['round_name']} {match['match_num']}: {a['name']} vs {b['name']}",
+                    })
+                    seen.add(match_id)
+                    next_position += 1
 
     def _card_to_booking_draft(self, run: dict, card: dict) -> dict:
         matches = []

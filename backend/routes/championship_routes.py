@@ -128,6 +128,20 @@ def _load_manager_state():
 # LIST ALL CHAMPIONSHIPS (Missing endpoint!)
 # ============================================================================
 
+
+@championship_bp.route('/reset-all-history', methods=['POST'])
+def api_reset_all_championship_history():
+    """Vacate every default/custom championship and clear title lineage/stat caches."""
+    try:
+        result = database.reset_all_championship_history()
+        return jsonify({
+            'success': True,
+            'message': 'All championships are vacant and title statistics have been cleared.',
+            **result,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @championship_bp.route('/', methods=['GET'])
 @championship_bp.route('', methods=['GET'])
 def api_get_all_championships():

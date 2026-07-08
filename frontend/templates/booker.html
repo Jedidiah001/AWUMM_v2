@@ -534,16 +534,33 @@
         <p class="special-panel-hint mb-0">No WarGames plan yet for the target event.</p>`;
       return;
     }
-    var factionA = plan.faction_a_json || [];
-    var factionB = plan.faction_b_json || [];
+    var divisions = plan.divisions_json || {};
     var advantage = plan.advantage_holder_json || {};
+    var hasDivisions = divisions.mens || divisions.womens;
+    var teamsHtml = '';
+    if (hasDivisions) {
+      [['mens', "Men's"], ['womens', "Women's"]].forEach(function(pair) {
+        var division = divisions[pair[0]] || {};
+        var teamA = division.team_a || [];
+        var teamB = division.team_b || [];
+        teamsHtml += `
+          <div class="bracket-round-label">${pair[1]} WarGames Match</div>
+          <div class="mb-1"><strong>${pair[1]} Team A</strong> (${teamA.length}): ${teamA.map(w => esc(w.name)).join(', ')}</div>
+          <div class="mb-2"><strong>${pair[1]} Team B</strong> (${teamB.length}): ${teamB.map(w => esc(w.name)).join(', ')}</div>`;
+      });
+    } else {
+      var factionA = plan.faction_a_json || [];
+      var factionB = plan.faction_b_json || [];
+      teamsHtml = `
+        <div class="mb-1"><strong>Team A</strong> (${factionA.length}): ${factionA.map(w => esc(w.name)).join(', ')}</div>
+        <div class="mb-2"><strong>Team B</strong> (${factionB.length}): ${factionB.map(w => esc(w.name)).join(', ')}</div>`;
+    }
     el.innerHTML = `
       <button class="btn btn-sm btn-primary w-100 mb-2" onclick="window.buildWarGamesPlan()">
         <i class="bi bi-arrow-clockwise"></i> Refresh Plan
       </button>
       <div class="decision-meta mb-1"><strong>${esc(plan.target_event_name || 'Target Event')}</strong> - Y${plan.target_year} W${plan.target_week}</div>
-      <div class="mb-1"><strong>Team A</strong> (${factionA.length}): ${factionA.map(w => esc(w.name)).join(', ')}</div>
-      <div class="mb-2"><strong>Team B</strong> (${factionB.length}): ${factionB.map(w => esc(w.name)).join(', ')}</div>
+      ${teamsHtml}
       <div class="decision-meta mb-2">Advantage: ${esc(advantage.name || 'TBD')}</div>
       <div class="btn-group btn-group-sm w-100 mb-2">
         <button class="btn btn-outline-success" onclick="window.sendWarGamesToBooking()"><i class="bi bi-send"></i> Send to Booking</button>
@@ -577,14 +594,27 @@
   window.sendWarGamesToBooking = function() {
     var plan = warGamesState.plan;
     if (!plan) return;
-    var factionA = (plan.faction_a_json || []);
-    var factionB = (plan.faction_b_json || []);
-    if (factionA.length < 2 || factionB.length < 2) {
-      if (window.showToast) showToast('Both factions need at least 2 members', 'warning');
+    var divisions = plan.divisions_json || {};
+    var matches = [];
+    if (divisions.mens || divisions.womens) {
+      [['mens', "Men's"], ['womens', "Women's"]].forEach(function(pair) {
+        var division = divisions[pair[0]] || {};
+        var teamA = division.team_a || [];
+        var teamB = division.team_b || [];
+        if (teamA.length && teamB.length) {
+          matches.push(buildSideMatchPayload('war_games', teamA, teamB, pair[1] + ' WarGames - ' + (plan.target_event_name || 'Faction War'), false));
+        }
+      });
+    } else {
+      var factionA = (plan.faction_a_json || []);
+      var factionB = (plan.faction_b_json || []);
+      if (factionA.length && factionB.length) matches.push(buildSideMatchPayload('war_games', factionA, factionB, 'WarGames - ' + (plan.target_event_name || 'Faction War'), false));
+    }
+    if (!matches.length) {
+      if (window.showToast) showToast('WarGames needs complete Team A and Team B sides', 'warning');
       return;
     }
-    var match = buildSideMatchPayload('war_games', factionA, factionB, 'WarGames - ' + (plan.target_event_name || 'Faction War'), false);
-    navigateToBookingWithMatches([match], 'Sending WarGames match to Booking Office...');
+    navigateToBookingWithMatches(matches, 'Sending WarGames matches to Booking Office...');
   };
 
   window.simulateWarGamesNow = async function() {
