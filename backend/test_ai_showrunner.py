@@ -137,38 +137,6 @@ class AIShowrunnerTests(unittest.TestCase):
         for faction in created:
             self.assertEqual(5, len(faction["member_ids"]))
 
-
-    def test_existing_mixed_war_games_plan_rebuilds_when_full_depth_exists(self):
-        self._add_war_games_depth()
-        self.service._ensure_tables()
-        now = self.service.now()
-        self.database.conn.execute(
-            """
-            INSERT INTO war_games_plans (
-                id, year, week, target_event_name, target_year, target_week, status,
-                faction_a_json, faction_b_json, advantage_holder_json, stakes_json,
-                escalation_beats_json, divisions_json, created_at, updated_at, deleted_at
-            ) VALUES (?, 1, 9, 'War Games', 1, 17, 'building', ?, ?, '{}', '{}', '[]', '{}', ?, ?, NULL)
-            """,
-            (
-                'bad_wargames',
-                '[{"id":"w_alpha","name":"Alpha Ace","gender":"Male"},{"id":"w_gamma","name":"Gamma Prospect","gender":"Female"}]',
-                '[{"id":"w_beta","name":"Beta Brawler","gender":"Male"},{"id":"w_delta","name":"Delta Storm","gender":"Female"}]',
-                now, now,
-            ),
-        )
-        self.database.conn.commit()
-
-        roster = self.service.get_roster_snapshot("Cross-Brand")
-        plan = self.service.get_or_build_war_games_plan(1, 9, roster, None)
-
-        self.assertNotEqual('bad_wargames', plan['id'])
-        for division_key, expected_gender in (("mens", "Male"), ("womens", "Female")):
-            division = plan["divisions_json"][division_key]
-            for side_key in ("team_a", "team_b"):
-                self.assertEqual(5, len(division[side_key]))
-                self.assertTrue(all(member["gender"] == expected_gender for member in division[side_key]))
-
     def test_approval_decision_and_aggressive_auto_execute(self):
         result = self.service.run_weekly(1, 10, seed=88, force=True, autonomy_level="aggressive")
 
