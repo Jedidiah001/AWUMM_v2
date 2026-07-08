@@ -231,15 +231,25 @@ class AIShowrunnerService:
         event_name = war_games.get("target_event_name") or "War Games"
         target_year = war_games.get("target_year") or war_games.get("year") or 1
         target_week = war_games.get("target_week") or war_games.get("week") or 1
-        sides = [
-            ("A", war_games.get("faction_a_json") or war_games.get("faction_a") or []),
-            ("B", war_games.get("faction_b_json") or war_games.get("faction_b") or []),
-        ]
+        divisions = war_games.get("divisions_json") or war_games.get("divisions") or {}
+        if divisions:
+            sides = []
+            for division_key, division_label in (("mens", "Men's"), ("womens", "Women's")):
+                division_plan = divisions.get(division_key) or {}
+                sides.extend([
+                    (f"{division_label} Team A", division_plan.get("team_a") or []),
+                    (f"{division_label} Team B", division_plan.get("team_b") or []),
+                ])
+        else:
+            sides = [
+                ("Team A", war_games.get("faction_a_json") or war_games.get("faction_a") or []),
+                ("Team B", war_games.get("faction_b_json") or war_games.get("faction_b") or []),
+            ]
         for label, members in sides:
             if len(members) < 3:
                 continue
             leader = members[0]
-            faction_name = f"{event_name} Team {label}"
+            faction_name = f"{event_name} {label}"
             faction = self._create_persistent_faction(
                 faction_name=faction_name,
                 members=members,
@@ -511,13 +521,18 @@ class AIShowrunnerService:
             f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
             required,
         )
-        if {row["name"] for row in rows} == set(required):
-            self._tables_ready = True
-            return
-
-        from persistence.phase_expansion_db import create_phase_expansion_tables
-        create_phase_expansion_tables(self.database)
+        if {row["name"] for row in rows} != set(required):
+            from persistence.phase_expansion_db import create_phase_expansion_tables
+            create_phase_expansion_tables(self.database)
+        self._ensure_war_games_divisions_column()
         self._tables_ready = True
+
+    def _ensure_war_games_divisions_column(self) -> None:
+        try:
+            self.conn.execute("ALTER TABLE war_games_plans ADD COLUMN divisions_json TEXT NOT NULL DEFAULT '{}'")
+            self.conn.commit()
+        except Exception:
+            pass
 
     def _current_show(self, universe, year: int, week: int) -> dict:
         show = None
@@ -1196,7 +1211,15 @@ class AIShowrunnerService:
             key=lambda w: (-float(w.get("momentum") or 0), -float(w.get("popularity") or 0), w.get("name", "")),
         )
         field = candidates[:count]
-        return [{"id": w["id"], "name": w["name"]} for w in field]
+        planned = next((row for row in self._mitb_rows("planned", 20) if row.get("division") == division), None)
+        if planned and planned.get("holder_id") and not any(w.get("id") == planned["holder_id"] for w in field):
+            holder = next((w for w in candidates if w.get("id") == planned["holder_id"]), None)
+            if holder:
+                if len(field) >= count and field:
+                    field[-1] = holder
+                else:
+                    field.append(holder)
+        return [{"id": w["id"], "name": w["name"]} for w in field[:count]]
 
     def book_fortunes_ladder_card(self, year: int, week: int, roster: list[dict]) -> dict:
         """Book both Money in the Bank ladder match fields for the Fortune's Ladder PLE."""
@@ -1748,10 +1771,33 @@ class AIShowrunnerService:
         if existing:
             return self._decode_war_games(existing)
         ranked = sorted(roster, key=lambda w: (w.get("overall", 0), w.get("popularity", 0)), reverse=True)
-        team_size = min(4, max(3, len(ranked) // 2))
-        faction_a = ranked[:team_size]
-        faction_b = ranked[team_size:team_size * 2] or ranked[-team_size:]
-        advantage = rng.choice(faction_a + faction_b)
+        divisions = {}
+        flat_teams = []
+        for division_key, gender in (("mens", "Male"), ("womens", "Female")):
+            pool = [w for w in ranked if str(w.get("gender", "")).lower() == gender.lower()]
+            team_size = 5 if len(pool) >= 10 else min(5, max(3, len(pool) // 2))
+            team_a = pool[:team_size]
+            team_b = pool[team_size:team_size * 2]
+            if len(team_a) >= 3 and len(team_b) >= 3:
+                divisions[division_key] = {
+                    "division": gender,
+                    "team_a": [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in team_a],
+                    "team_b": [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in team_b],
+                }
+                flat_teams.extend(team_a + team_b)
+        if divisions.get("mens"):
+            faction_a = divisions["mens"]["team_a"]
+            faction_b = divisions["mens"]["team_b"]
+        elif divisions:
+            first = next(iter(divisions.values()))
+            faction_a = first["team_a"]
+            faction_b = first["team_b"]
+        else:
+            team_size = min(4, max(3, len(ranked) // 2))
+            faction_a = [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in ranked[:team_size]]
+            faction_b = [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in (ranked[team_size:team_size * 2] or ranked[-team_size:])]
+        advantage_pool = flat_teams or ranked
+        advantage = rng.choice(advantage_pool)
         beats = [
             "Week 1: locker-room pull-apart",
             "Week 2: advantage match",
@@ -1765,16 +1811,17 @@ class AIShowrunnerService:
             INSERT INTO war_games_plans (
                 id, year, week, target_event_name, target_year, target_week, status,
                 faction_a_json, faction_b_json, advantage_holder_json, stakes_json,
-                escalation_beats_json, created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, NULL)
+                escalation_beats_json, divisions_json, created_at, updated_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 row_id, year, week, target_name, target_year, target_week,
-                json.dumps([{"id": w["id"], "name": w["name"]} for w in faction_a]),
-                json.dumps([{"id": w["id"], "name": w["name"]} for w in faction_b]),
+                json.dumps(faction_a),
+                json.dumps(faction_b),
                 json.dumps({"id": advantage["id"], "name": advantage["name"]}),
                 json.dumps({"prize": "brand control advantage", "risk": "faction fracture if mishandled"}),
                 json.dumps(beats),
+                json.dumps(divisions),
                 now,
                 now,
             ),
@@ -1987,7 +2034,7 @@ class AIShowrunnerService:
                 "war_games",
                 "high",
                 f"War Games build: {war_games['target_event_name']}",
-                f"AI formed two faction sides and an advantage-match road for Y{war_games['target_year']} W{war_games['target_week']}.",
+                f"AI is forming separate men’s and women’s five-person War Games sides for Y{war_games['target_year']} W{war_games['target_week']}.",
                 {"war_games": war_games, "recommended_action": "approve_counter_or_rebuild_teams"},
                 "ask",
                 None,
@@ -2268,6 +2315,7 @@ class AIShowrunnerService:
         row["advantage_holder_json"] = self.repo.from_json(row.get("advantage_holder_json"), {})
         row["stakes_json"] = self.repo.from_json(row.get("stakes_json"), {})
         row["escalation_beats_json"] = self.repo.from_json(row.get("escalation_beats_json"), [])
+        row["divisions_json"] = self.repo.from_json(row.get("divisions_json"), {})
         return row
 
     def _decode_crown(self, row: dict | None) -> dict:
