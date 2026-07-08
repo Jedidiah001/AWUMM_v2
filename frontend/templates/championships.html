@@ -1951,8 +1951,16 @@
                 if (currentYear == null || currentWeek == null || reign.won_date_year == null || reign.won_date_week == null) {
                     return null;
                 }
-                var weeksHeld = ((currentYear - reign.won_date_year) * 52) + (currentWeek - reign.won_date_week);
-                return Math.max(0, weeksHeld * 7);
+                var dayOffset = function(showName) {
+                    var name = String(showName || '').toLowerCase();
+                    if (name.includes('velocity')) return 0;
+                    if (name.includes('vanguard')) return 3;
+                    if (name.includes('alpha')) return 4;
+                    return 0;
+                };
+                var start = (((reign.won_date_year - 1) * 52) + (reign.won_date_week - 1)) * 7 + dayOffset(reign.won_at_show_name);
+                var end = (((currentYear - 1) * 52) + (currentWeek - 1)) * 7;
+                return Math.max(0, end - start);
             };
             var formatWonAt = function(reign) {
                 var showName = reign.won_at_show_name || 'Unknown Event';
@@ -1969,11 +1977,11 @@
                 var isCurrentHolder = !champ.is_vacant &&
                     String(champ.current_holder_id || '') === String(reign.wrestler_id || '');
                 var daysHeldText = '';
-                if (reign.days_held != null && reign.days_held !== '') {
-                    daysHeldText = reign.days_held + ' days';
-                } else if (isCurrentHolder) {
+                if (isCurrentHolder) {
                     var currentDays = computeCurrentDays(reign);
                     daysHeldText = currentDays == null ? 'Current' : 'Current (' + currentDays + ' days)';
+                } else if (reign.days_held != null && reign.days_held !== '') {
+                    daysHeldText = Math.max(0, Number(reign.days_held) || 0) + ' days';
                 } else {
                     daysHeldText = '—';
                 }

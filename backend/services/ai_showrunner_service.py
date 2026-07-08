@@ -222,6 +222,8 @@ class AIShowrunnerService:
                 arc = recommendation.get("living_arc") or {}
                 if arc.get("arc_type") == "faction_formation_betrayal_seed":
                     self._materialize_living_arc_faction(arc)
+                elif arc.get("arc_type") == "alignment_turn":
+                    self._materialize_alignment_turn(arc)
         except Exception:
             # Approval decisions should still persist even if optional world materialization fails.
             pass
@@ -231,15 +233,25 @@ class AIShowrunnerService:
         event_name = war_games.get("target_event_name") or "War Games"
         target_year = war_games.get("target_year") or war_games.get("year") or 1
         target_week = war_games.get("target_week") or war_games.get("week") or 1
-        sides = [
-            ("A", war_games.get("faction_a_json") or war_games.get("faction_a") or []),
-            ("B", war_games.get("faction_b_json") or war_games.get("faction_b") or []),
-        ]
+        divisions = war_games.get("divisions_json") or war_games.get("divisions") or {}
+        if divisions:
+            sides = []
+            for division_key, division_label in (("mens", "Men's"), ("womens", "Women's")):
+                division_plan = divisions.get(division_key) or {}
+                sides.extend([
+                    (f"{division_label} Team A", division_plan.get("team_a") or []),
+                    (f"{division_label} Team B", division_plan.get("team_b") or []),
+                ])
+        else:
+            sides = [
+                ("Team A", war_games.get("faction_a_json") or war_games.get("faction_a") or []),
+                ("Team B", war_games.get("faction_b_json") or war_games.get("faction_b") or []),
+            ]
         for label, members in sides:
             if len(members) < 3:
                 continue
             leader = members[0]
-            faction_name = f"{event_name} Team {label}"
+            faction_name = f"{event_name} {label}"
             faction = self._create_persistent_faction(
                 faction_name=faction_name,
                 members=members,
@@ -256,6 +268,20 @@ class AIShowrunnerService:
             if faction:
                 created.append(faction)
         return created
+
+
+    def _materialize_alignment_turn(self, arc: dict) -> None:
+        target = arc.get("target_alignment")
+        participant = next((p for p in arc.get("participants", []) if p.get("role") == "turn_focus"), None)
+        if not target or not participant or not participant.get("id"):
+            return
+        percentage = {"Heel": 0, "Tweener": 50, "Face": 100}.get(target, 50)
+        now = self.now()
+        self.conn.execute(
+            "UPDATE wrestlers SET alignment = ?, alignment_percentage = ?, updated_at = ? WHERE id = ?",
+            (target, percentage, now, participant["id"]),
+        )
+        self.conn.commit()
 
     def _materialize_living_arc_faction(self, arc: dict) -> dict | None:
         participants = arc.get("participants") or []
@@ -363,6 +389,7 @@ class AIShowrunnerService:
         self._decode_run(run)
         card = run.get("generated_card_json") or {}
         draft = self._card_to_booking_draft(run, card)
+        self._append_scheduled_crown_matches_to_draft(draft)
         return {
             "available": True,
             "run": {
@@ -511,13 +538,18 @@ class AIShowrunnerService:
             f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
             required,
         )
-        if {row["name"] for row in rows} == set(required):
-            self._tables_ready = True
-            return
-
-        from persistence.phase_expansion_db import create_phase_expansion_tables
-        create_phase_expansion_tables(self.database)
+        if {row["name"] for row in rows} != set(required):
+            from persistence.phase_expansion_db import create_phase_expansion_tables
+            create_phase_expansion_tables(self.database)
+        self._ensure_war_games_divisions_column()
         self._tables_ready = True
+
+    def _ensure_war_games_divisions_column(self) -> None:
+        try:
+            self.conn.execute("ALTER TABLE war_games_plans ADD COLUMN divisions_json TEXT NOT NULL DEFAULT '{}'")
+            self.conn.commit()
+        except Exception:
+            pass
 
     def _current_show(self, universe, year: int, week: int) -> dict:
         show = None
@@ -1016,7 +1048,7 @@ class AIShowrunnerService:
                 turn_candidate = ranked[min(1, len(ranked) - 1)]
                 current = str(turn_candidate.get("alignment") or "Tweener")
                 target = rng.choice([a for a in ["Face", "Heel", "Tweener"] if a != current] or ["Tweener"])
-                proposals.append({"arc_type": "alignment_turn", "brand": brand, "division": gender, "title": f"Turn arc: {turn_candidate['name']} toward {target}", "summary": f"Begin a paced {current}-to-{target} character shift for {turn_candidate['name']} with weekly story consequences before any final turn is applied.", "participants": [{"id": turn_candidate["id"], "name": turn_candidate["name"], "role": "turn_focus"}], "beats": ["Ambiguous promo motive", "Choice between friend and ambition", "Crowd-reaction checkpoint", "Major-show reveal", "Approval decides final alignment"], "mechanical_effects": ["character_direction +10", "alignment_pressure +12", "story_progression +8"]})
+                proposals.append({"arc_type": "alignment_turn", "brand": brand, "division": gender, "target_alignment": target, "title": f"Turn arc: {turn_candidate['name']} toward {target}", "summary": f"Begin a paced {current}-to-{target} character shift for {turn_candidate['name']} with weekly story consequences before any final turn is applied.", "participants": [{"id": turn_candidate["id"], "name": turn_candidate["name"], "role": "turn_focus"}], "beats": ["Ambiguous promo motive", "Choice between friend and ambition", "Crowd-reaction checkpoint", "Major-show reveal", "Approval decides final alignment"], "mechanical_effects": ["character_direction +10", "alignment_pressure +12", "story_progression +8"]})
         rng.shuffle(proposals)
         return proposals[: (4 if is_major_window else 2)]
 
@@ -1196,7 +1228,15 @@ class AIShowrunnerService:
             key=lambda w: (-float(w.get("momentum") or 0), -float(w.get("popularity") or 0), w.get("name", "")),
         )
         field = candidates[:count]
-        return [{"id": w["id"], "name": w["name"]} for w in field]
+        planned = next((row for row in self._mitb_rows("planned", 20) if row.get("division") == division), None)
+        if planned and planned.get("holder_id") and not any(w.get("id") == planned["holder_id"] for w in field):
+            holder = next((w for w in candidates if w.get("id") == planned["holder_id"]), None)
+            if holder:
+                if len(field) >= count and field:
+                    field[-1] = holder
+                else:
+                    field.append(holder)
+        return [{"id": w["id"], "name": w["name"]} for w in field[:count]]
 
     def book_fortunes_ladder_card(self, year: int, week: int, roster: list[dict]) -> dict:
         """Book both Money in the Bank ladder match fields for the Fortune's Ladder PLE."""
@@ -1335,6 +1375,28 @@ class AIShowrunnerService:
         """Fetch the existing WarGames plan for the upcoming target event, or build one."""
         self._ensure_tables()
         return self._refresh_war_games_system(year, week, roster, universe, rng or random.Random())
+
+    def _full_war_games_depth_available(self, roster: list[dict]) -> bool:
+        return all(
+            len([w for w in roster if str(w.get("gender", "")).lower() == gender]) >= 10
+            for gender in ("male", "female")
+        )
+
+    def _war_games_plan_is_full_gender_split(self, plan: dict) -> bool:
+        divisions = plan.get("divisions_json") or plan.get("divisions") or {}
+        for division_key, gender in (("mens", "male"), ("womens", "female")):
+            division = divisions.get(division_key) or {}
+            for side_key in ("team_a", "team_b"):
+                team = division.get(side_key) or []
+                if len(team) != 5:
+                    return False
+                if any(str(member.get("gender", "")).lower() != gender for member in team):
+                    return False
+        return True
+
+    def _delete_invalid_war_games_plan(self, plan_id: str) -> None:
+        self.conn.execute("DELETE FROM war_games_plans WHERE id = ?", (plan_id,))
+        self.conn.commit()
 
     def _row_to_wrestler(self, row: dict):
         from models.wrestler import Wrestler
@@ -1746,12 +1808,38 @@ class AIShowrunnerService:
             (target_name, target_year, target_week),
         )
         if existing:
-            return self._decode_war_games(existing)
+            decoded_existing = self._decode_war_games(existing)
+            if not (self._full_war_games_depth_available(roster) and not self._war_games_plan_is_full_gender_split(decoded_existing)):
+                return decoded_existing
+            self._delete_invalid_war_games_plan(decoded_existing["id"])
         ranked = sorted(roster, key=lambda w: (w.get("overall", 0), w.get("popularity", 0)), reverse=True)
-        team_size = min(4, max(3, len(ranked) // 2))
-        faction_a = ranked[:team_size]
-        faction_b = ranked[team_size:team_size * 2] or ranked[-team_size:]
-        advantage = rng.choice(faction_a + faction_b)
+        divisions = {}
+        flat_teams = []
+        for division_key, gender in (("mens", "Male"), ("womens", "Female")):
+            pool = [w for w in ranked if str(w.get("gender", "")).lower() == gender.lower()]
+            team_size = 5 if len(pool) >= 10 else min(5, max(3, len(pool) // 2))
+            team_a = pool[:team_size]
+            team_b = pool[team_size:team_size * 2]
+            if len(team_a) >= 3 and len(team_b) >= 3:
+                divisions[division_key] = {
+                    "division": gender,
+                    "team_a": [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in team_a],
+                    "team_b": [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in team_b],
+                }
+                flat_teams.extend(team_a + team_b)
+        if divisions.get("mens"):
+            faction_a = divisions["mens"]["team_a"]
+            faction_b = divisions["mens"]["team_b"]
+        elif divisions:
+            first = next(iter(divisions.values()))
+            faction_a = first["team_a"]
+            faction_b = first["team_b"]
+        else:
+            team_size = min(4, max(3, len(ranked) // 2))
+            faction_a = [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in ranked[:team_size]]
+            faction_b = [{"id": w["id"], "name": w["name"], "gender": w.get("gender")} for w in (ranked[team_size:team_size * 2] or ranked[-team_size:])]
+        advantage_pool = flat_teams or ranked
+        advantage = rng.choice(advantage_pool)
         beats = [
             "Week 1: locker-room pull-apart",
             "Week 2: advantage match",
@@ -1765,16 +1853,17 @@ class AIShowrunnerService:
             INSERT INTO war_games_plans (
                 id, year, week, target_event_name, target_year, target_week, status,
                 faction_a_json, faction_b_json, advantage_holder_json, stakes_json,
-                escalation_beats_json, created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, NULL)
+                escalation_beats_json, divisions_json, created_at, updated_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
                 row_id, year, week, target_name, target_year, target_week,
-                json.dumps([{"id": w["id"], "name": w["name"]} for w in faction_a]),
-                json.dumps([{"id": w["id"], "name": w["name"]} for w in faction_b]),
+                json.dumps(faction_a),
+                json.dumps(faction_b),
                 json.dumps({"id": advantage["id"], "name": advantage["name"]}),
                 json.dumps({"prize": "brand control advantage", "risk": "faction fracture if mishandled"}),
                 json.dumps(beats),
+                json.dumps(divisions),
                 now,
                 now,
             ),
@@ -1987,7 +2076,7 @@ class AIShowrunnerService:
                 "war_games",
                 "high",
                 f"War Games build: {war_games['target_event_name']}",
-                f"AI formed two faction sides and an advantage-match road for Y{war_games['target_year']} W{war_games['target_week']}.",
+                f"AI is forming separate men’s and women’s five-person War Games sides for Y{war_games['target_year']} W{war_games['target_week']}.",
                 {"war_games": war_games, "recommended_action": "approve_counter_or_rebuild_teams"},
                 "ask",
                 None,
@@ -2121,6 +2210,49 @@ class AIShowrunnerService:
             "warnings": ["AI-generated card: review major/title implications before simulating."],
         }
         return self.repo.replace_show_plan(plan, segments)
+
+
+    def _append_scheduled_crown_matches_to_draft(self, draft: dict) -> None:
+        """Add ready King/Queen tournament matches scheduled for this show/week into the AI draft."""
+        tournaments = self.list_crown_tournaments(limit=10)
+        next_position = max([int(m.get("card_position") or m.get("position") or 0) for m in draft.get("matches", [])] + [0]) + 1
+        seen = {m.get("match_id") for m in draft.get("matches", [])}
+        for tournament in tournaments:
+            for round_data in (tournament.get("bracket") or {}).get("rounds", []):
+                for match in round_data.get("matches", []):
+                    scheduled = match.get("scheduled") or {}
+                    same_show = scheduled.get("show_id") and scheduled.get("show_id") == draft.get("show_id")
+                    same_week = int(scheduled.get("year") or draft.get("year") or 0) == int(draft.get("year") or 0) and int(scheduled.get("week") or 0) == int(draft.get("week") or 0)
+                    if not (same_show or same_week):
+                        continue
+                    if match.get("winner") or not match.get("wrestler_a") or not match.get("wrestler_b"):
+                        continue
+                    match_id = f"crown_{tournament['id']}_r{round_data['round']}_m{match['match_num']}"
+                    if match_id in seen:
+                        continue
+                    a, b = match["wrestler_a"], match["wrestler_b"]
+                    draft.setdefault("matches", []).append({
+                        "match_id": match_id,
+                        "match_type": "singles",
+                        "participants": [a["id"], b["id"]],
+                        "side_a": {"wrestler_ids": [a["id"]], "wrestler_names": [a["name"]], "is_tag_team": False},
+                        "side_b": {"wrestler_ids": [b["id"]], "wrestler_names": [b["name"]], "is_tag_team": False},
+                        "booked_winner": (match.get("winner") or {}).get("id"),
+                        "booking_bias": "even",
+                        "importance": "tournament",
+                        "planned_duration_minutes": 12 if round_data["round"] < 3 else 18,
+                        "duration": 12 if round_data["round"] < 3 else 18,
+                        "position": next_position,
+                        "card_position": next_position,
+                        "is_title_match": False,
+                        "allow_cross_brand": True,
+                        "tournament_id": tournament["id"],
+                        "tournament_round": round_data["round"],
+                        "tournament_match_num": match["match_num"],
+                        "ai_description": f"{tournament['name']} {round_data['round_name']} {match['match_num']}: {a['name']} vs {b['name']}",
+                    })
+                    seen.add(match_id)
+                    next_position += 1
 
     def _card_to_booking_draft(self, run: dict, card: dict) -> dict:
         matches = []
@@ -2268,6 +2400,7 @@ class AIShowrunnerService:
         row["advantage_holder_json"] = self.repo.from_json(row.get("advantage_holder_json"), {})
         row["stakes_json"] = self.repo.from_json(row.get("stakes_json"), {})
         row["escalation_beats_json"] = self.repo.from_json(row.get("escalation_beats_json"), [])
+        row["divisions_json"] = self.repo.from_json(row.get("divisions_json"), {})
         return row
 
     def _decode_crown(self, row: dict | None) -> dict:

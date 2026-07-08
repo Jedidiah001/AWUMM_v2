@@ -1391,6 +1391,7 @@ CREATE TABLE IF NOT EXISTS war_games_plans (
     advantage_holder_json TEXT NOT NULL DEFAULT '{}',
     stakes_json TEXT NOT NULL DEFAULT '{}',
     escalation_beats_json TEXT NOT NULL DEFAULT '[]',
+    divisions_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     deleted_at TEXT

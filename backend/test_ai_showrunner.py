@@ -52,6 +52,28 @@ class AIShowrunnerTests(unittest.TestCase):
         )
         self.database.conn.commit()
 
+    def _add_war_games_depth(self):
+        now = "2026-06-30T00:00:00"
+        rows = []
+        for idx in range(10):
+            rows.append((f"wg_m_{idx}", f"War Man {idx}", 30 + idx, "Male", "face", "midcard", "Cross-Brand", 70 + idx, 70, 60, 60, 70, 70, 8, 0, 70 + idx, 20, 70, 0, "None", None, 0, 80000, 52, 40, 1, 1, 0))
+            rows.append((f"wg_w_{idx}", f"War Woman {idx}", 28 + idx, "Female", "heel", "midcard", "Cross-Brand", 68 + idx, 70, 65, 62, 70, 70, 8, 0, 68 + idx, 20, 70, 0, "None", None, 0, 80000, 52, 40, 1, 1, 0))
+        self.database.conn.executemany(
+            """
+            INSERT OR REPLACE INTO wrestlers (
+                id, name, age, gender, alignment, role, primary_brand,
+                brawling, technical, speed, mic, psychology, stamina,
+                years_experience, is_major_superstar, popularity, momentum,
+                morale, fatigue, injury_severity, injury_description,
+                injury_weeks_remaining, contract_salary, contract_total_weeks,
+                contract_weeks_remaining, contract_signing_year,
+                contract_signing_week, is_retired, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [row + (now, now) for row in rows],
+        )
+        self.database.conn.commit()
+
     def test_weekly_showrunner_persists_card_roadmap_and_approvals(self):
         result = self.service.run_weekly(1, 9, seed=77, force=True, autonomy_level="balanced")
 
@@ -93,7 +115,8 @@ class AIShowrunnerTests(unittest.TestCase):
         self.assertIn("dark_house_autopilot", categories)
         self.assertIn("promo_dialogue", categories)
 
-    def test_approving_war_games_materializes_factions(self):
+    def test_approving_war_games_materializes_gender_separated_factions(self):
+        self._add_war_games_depth()
         self.service.run_weekly(1, 9, seed=77, force=True, autonomy_level="balanced")
         dashboard = self.service.dashboard()
         war_games_item = next(item for item in dashboard["pending_approvals"] if item["category"] == "war_games")
@@ -102,10 +125,49 @@ class AIShowrunnerTests(unittest.TestCase):
         self.service.decide_approval(war_games_item["id"], {"decision": "approve", "notes": "Lock the teams."})
         after = self.database.get_all_factions(active_only=True)
 
-        self.assertGreaterEqual(len(after), len(before) + 1)
-        names = {faction["faction_name"] for faction in after}
-        self.assertTrue(any(name.endswith("Team A") for name in names))
-        self.assertTrue(any("Team" in name for name in names))
+        created = [f for f in after if f not in before and f["faction_name"].startswith("War Games")]
+        self.assertEqual(4, len(created))
+        expected_names = {
+            "War Games Men's Team A",
+            "War Games Men's Team B",
+            "War Games Women's Team A",
+            "War Games Women's Team B",
+        }
+        self.assertEqual(expected_names, {f["faction_name"] for f in created})
+        for faction in created:
+            self.assertEqual(5, len(faction["member_ids"]))
+
+
+    def test_existing_mixed_war_games_plan_rebuilds_when_full_depth_exists(self):
+        self._add_war_games_depth()
+        self.service._ensure_tables()
+        now = self.service.now()
+        self.database.conn.execute(
+            """
+            INSERT INTO war_games_plans (
+                id, year, week, target_event_name, target_year, target_week, status,
+                faction_a_json, faction_b_json, advantage_holder_json, stakes_json,
+                escalation_beats_json, divisions_json, created_at, updated_at, deleted_at
+            ) VALUES (?, 1, 9, 'War Games', 1, 17, 'building', ?, ?, '{}', '{}', '[]', '{}', ?, ?, NULL)
+            """,
+            (
+                'bad_wargames',
+                '[{"id":"w_alpha","name":"Alpha Ace","gender":"Male"},{"id":"w_gamma","name":"Gamma Prospect","gender":"Female"}]',
+                '[{"id":"w_beta","name":"Beta Brawler","gender":"Male"},{"id":"w_delta","name":"Delta Storm","gender":"Female"}]',
+                now, now,
+            ),
+        )
+        self.database.conn.commit()
+
+        roster = self.service.get_roster_snapshot("Cross-Brand")
+        plan = self.service.get_or_build_war_games_plan(1, 9, roster, None)
+
+        self.assertNotEqual('bad_wargames', plan['id'])
+        for division_key, expected_gender in (("mens", "Male"), ("womens", "Female")):
+            division = plan["divisions_json"][division_key]
+            for side_key in ("team_a", "team_b"):
+                self.assertEqual(5, len(division[side_key]))
+                self.assertTrue(all(member["gender"] == expected_gender for member in division[side_key]))
 
     def test_approval_decision_and_aggressive_auto_execute(self):
         result = self.service.run_weekly(1, 10, seed=88, force=True, autonomy_level="aggressive")

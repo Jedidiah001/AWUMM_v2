@@ -10,6 +10,25 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 
+def _show_day_offset(show_name: str | None) -> int:
+    """Return in-week day offset for the promotion's weekly show cadence."""
+    name = (show_name or "").lower()
+    if "velocity" in name:
+        return 0  # Mondays
+    if "vanguard" in name:
+        return 3  # Thursdays
+    if "alpha" in name:
+        return 4  # Fridays
+    return 0
+
+def calculate_reign_days(won_year: int, won_week: int, won_show_name: str | None,
+                         end_year: int, end_week: int, end_show_name: str | None = None) -> int:
+    """Calculate non-negative title reign length using year/week plus known show weekdays."""
+    start = ((int(won_year) - 1) * 52 + (int(won_week) - 1)) * 7 + _show_day_offset(won_show_name)
+    end = ((int(end_year) - 1) * 52 + (int(end_week) - 1)) * 7 + _show_day_offset(end_show_name)
+    return max(0, end - start)
+
+
 @dataclass
 class TitleReign:
     """Single title reign record"""
@@ -253,9 +272,10 @@ class Championship:
                     current_reign.lost_date_year = year
                     current_reign.lost_date_week = week
                     
-                    # Calculate days held (approximate: 7 days per week)
-                    weeks_held = (year - current_reign.won_date_year) * 52 + (week - current_reign.won_date_week)
-                    current_reign.days_held = weeks_held * 7
+                    current_reign.days_held = calculate_reign_days(
+                        current_reign.won_date_year, current_reign.won_date_week, current_reign.won_at_show_name,
+                        year, week, show_name,
+                    )
             
             # Clear interim if any
             if self.has_interim_champion:
@@ -266,8 +286,10 @@ class Championship:
                         reign.lost_at_show_name = show_name
                         reign.lost_date_year = year
                         reign.lost_date_week = week
-                        weeks_held = (year - reign.won_date_year) * 52 + (week - reign.won_date_week)
-                        reign.days_held = weeks_held * 7
+                        reign.days_held = calculate_reign_days(
+                            reign.won_date_year, reign.won_date_week, reign.won_at_show_name,
+                            year, week, show_name,
+                        )
                         break
                 
                 self.interim_holder_id = None
@@ -329,8 +351,10 @@ class Championship:
             current_reign.lost_date_year = year
             current_reign.lost_date_week = week
             
-            weeks_held = (year - current_reign.won_date_year) * 52 + (week - current_reign.won_date_week)
-            current_reign.days_held = weeks_held * 7
+            current_reign.days_held = calculate_reign_days(
+                current_reign.won_date_year, current_reign.won_date_week, current_reign.won_at_show_name,
+                year, week, show_name,
+            )
         
         # Also end interim reign if any
         if self.has_interim_champion:
@@ -340,8 +364,10 @@ class Championship:
                     reign.lost_at_show_name = show_name
                     reign.lost_date_year = year
                     reign.lost_date_week = week
-                    weeks_held = (year - reign.won_date_year) * 52 + (week - reign.won_date_week)
-                    reign.days_held = weeks_held * 7
+                    reign.days_held = calculate_reign_days(
+                        reign.won_date_year, reign.won_date_week, reign.won_at_show_name,
+                        year, week, show_name,
+                    )
                     break
             
             self.interim_holder_id = None
@@ -369,8 +395,10 @@ class Championship:
                 reign.lost_at_show_name = show_name
                 reign.lost_date_year = year
                 reign.lost_date_week = week
-                weeks_held = (year - reign.won_date_year) * 52 + (week - reign.won_date_week)
-                reign.days_held = weeks_held * 7
+                reign.days_held = calculate_reign_days(
+                    reign.won_date_year, reign.won_date_week, reign.won_at_show_name,
+                    year, week, show_name,
+                )
                 break
         
         self.interim_holder_id = None
@@ -421,8 +449,10 @@ class Championship:
         if not current_reign:
             return 0
         
-        weeks_held = (current_year - current_reign.won_date_year) * 52 + (current_week - current_reign.won_date_week)
-        return weeks_held * 7
+        return calculate_reign_days(
+            current_reign.won_date_year, current_reign.won_date_week, current_reign.won_at_show_name,
+            current_year, current_week, None,
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON"""

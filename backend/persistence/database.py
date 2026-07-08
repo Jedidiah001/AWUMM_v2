@@ -986,6 +986,36 @@ class Database:
             ))
     
     
+
+    def reset_all_championship_history(self) -> Dict[str, int]:
+        """Vacate every championship and clear title lineage/stat caches for a fresh start."""
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        championship_count = cursor.execute('SELECT COUNT(*) AS count FROM championships').fetchone()['count']
+        reign_count = cursor.execute('SELECT COUNT(*) AS count FROM title_reigns').fetchone()['count']
+        cursor.execute('''
+            UPDATE championships
+            SET current_holder_id = NULL,
+                current_holder_name = NULL,
+                interim_holder_id = NULL,
+                interim_holder_name = NULL,
+                last_defense_year = NULL,
+                last_defense_week = NULL,
+                last_defense_show_id = NULL,
+                total_defenses = 0,
+                updated_at = ?
+        ''', (now,))
+        cursor.execute('DELETE FROM title_reigns')
+        cursor.execute('''
+            UPDATE wrestler_stats
+            SET total_title_reigns = 0,
+                total_days_as_champion = 0,
+                longest_reign_days = 0,
+                last_updated = ?
+        ''', (now,))
+        self.conn.commit()
+        return {"championships_vacated": championship_count or 0, "reigns_deleted": reign_count or 0}
+
     def get_all_championships(self) -> List[Dict[str, Any]]:
         """Get all championships"""
         cursor = self.conn.cursor()
